@@ -1,88 +1,95 @@
-name: Build iOS App (IPA)
+name: Build Pal IPA (unsigned)
 
 on:
-  push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pal-ios-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build IPA
-    runs-on: macos-14
+    name: Build iOS app
+    runs-on: macos-15
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Select Xcode
-        run: sudo xcode-select -switch /Applications/Xcode_15.4.app
+      - name: Show Xcode version
+        run: xcodebuild -version
 
-      - name: Diagnostic - Lister les fichiers du dépôt
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Download llama.cpp iOS XCFramework (latest release that has one)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Structure du dépôt :"
-          ls -la
-          find . -maxdepth 2 -name "*.xcodeproj" -o -name "*.xcworkspace" -o -name "Package.swift"
+          set -eu
+          R=ggml-org/llama.cpp
+          TAG=""
+          for t in $(gh release list --repo $R --limit 20 --json tagName -q '.[].tagName'); do
+            A=$(gh release view "$t" --repo $R --json assets -q '.assets[].name')
+            if echo "$A" | grep -qi xcframework; then TAG="$t"; break; fi
+          done
+          [ -n "$TAG" ] || { echo "Aucune release avec XCFramework" >&2; exit 1; }
+          echo "Version utilisée : $TAG"
+          mkdir -p vendor/download vendor/unpacked
+          gh release download "$TAG" --repo $R --pattern '*xcframework*' --dir vendor/download
+          for f in vendor/download/*; do
+            case "$f" in
+              *.zip) unzip -q "$f" -d vendor/unpacked ;;
+              *.tar.gz|*.tgz) tar -xzf "$f" -C vendor/unpacked ;;
+            esac
+          done
+          FRAMEWORK_DIR="$(find vendor/unpacked -type d -name 'llama.xcframework' -print -quit)"
+          [ -n "$FRAMEWORK_DIR" ] || { echo "llama.xcframework introuvable" >&2; find vendor/unpacked -maxdepth 4; exit 1; }
+          ditto "$FRAMEWORK_DIR" ./llama.xcframework
 
-      - name: Build Xcode Project
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build for physical iOS devices (unsigned)
         run: |
-          set -o pipefail
-          
-          # Recherche automatique du workspace ou du project
-          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -n 1)
-          PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
-          
-          if [ -n "$WORKSPACE" ]; then
-            echo "Workspace trouvé : $WORKSPACE"
-            SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json | jq -r '.workspace.schemes[0]')
-            echo "Schéma détecté : $SCHEME"
-            
-            xcodebuild archive \
-              -workspace "$WORKSPACE" \
-              -scheme "$SCHEME" \
-              -sdk iphoneos \
-              -configuration Release \
-              -archivePath build/PalApp.xcarchive \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGN_ENTITLEMENTS=""
-              
-          elif [ -n "$PROJECT" ]; then
-            echo "Projet trouvé : $PROJECT"
-            SCHEME=$(xcodebuild -project "$PROJECT" -list -json | jq -r '.project.schemes[0]')
-            echo "Schéma détecté : $SCHEME"
-            
-            xcodebuild archive \
-              -project "$PROJECT" \
-              -scheme "$SCHEME" \
-              -sdk iphoneos \
-              -configuration Release \
-              -archivePath build/PalApp.xcarchive \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGN_ENTITLEMENTS=""
-          else
-            echo "❌ Erreur : Aucun fichier .xcodeproj ou .xcworkspace n'a été trouvé dans le dépôt !"
-            echo "Vérifiez que vous avez bien poussé votre projet Xcode et pas seulement les fichiers .swift isolés."
-            exit 1
-          fi
+          set -euo pipefail
+          xcodebuild \
+            -project Pal.xcodeproj \
+            -scheme Pal \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
 
-      - name: Package IPA
+      - name: Package unsigned IPA
         run: |
-          mkdir -p Payload
-          cp -R build/PalApp.xcarchive/Products/Applications/*.app Payload/
-          cd build
-          zip -r PalApp.ipa Payload
-          mv PalApp.ipa ../
-          cd ..
+          set -euo pipefail
+          APP_PATH="build/Build/Products/Release-iphoneos/Pal.app"
+          test -d "$APP_PATH"
+          rm -rf Payload Pal.ipa
+          mkdir Payload
+          ditto "$APP_PATH" "Payload/Pal.app"
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload Pal.ipa
+          test -s Pal.ipa
 
-      - name: Upload IPA Artifact
+      - name: Upload IPA and build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: PalApp-unsigned-ipa
-          path: PalApp.ipa
+          name: Pal-ipa-unsigned
+          path: |
+            Pal.ipa
+            build/Logs/Build/*.xcactivitylog
+          if-no-files-found: warn
+          retention-days: 14
