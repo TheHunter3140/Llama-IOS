@@ -1,22 +1,74 @@
-name: Build IPA
-on: { workflow_dispatch: {}, push: { branches: [main] } }
+name: Build iOS App (IPA)
+on:
+push:
+branches: [ "main", "master" ]
+pull_request:
+branches: [ "main", "master" ]
+workflow_dispatch: # Permet de lancer le build manuellement depuis GitHub
 jobs:
-  build:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: llama.xcframework
-        env: { GH_TOKEN: "${{ github.token }}" }
-        run: |
-          gh release download --repo ggml-org/llama.cpp --pattern '*xcframework*.zip' --dir dl
-          unzip -q dl/*.zip -d dl/x
-          cp -R "$(find dl/x -name llama.xcframework -maxdepth 4 | head -1)" .
-      - run: brew install xcodegen && xcodegen generate
-      - name: Build
-        run: |
-          xcodebuild -project Pal.xcodeproj -scheme Pal -configuration Release -sdk iphoneos \
-            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
-          mkdir Payload && cp -R build/Build/Products/Release-iphoneos/Pal.app Payload/
-          zip -qr Pal.ipa Payload
-      - uses: actions/upload-artifact@v4
-        with: { name: Pal-ipa, path: Pal.ipa }
+build:
+name: Build IPA
+runs-on: macos-14 # macOS Sonoma avec Xcode récents
+steps:
+- name: Checkout repository
+uses: actions/checkout@v4
+with:
+submodules: recursive # Utile si llama.cpp est en sous-module Git
+- name: Select Xcode
+run: sudo xcode-select -switch /Applications/Xcode_15.4.app/Contents/Developer
+- name: Cache SPM Dependencies
+uses: actions/cache@v4
+with:
+path: .build
+key: {{ runner.os }}-spm-{{ hashFiles('/Package.resolved') }}
+restore-keys: |
+${{ runner.os }}-spm-
+- name: Build Xcode Project
+run: |
+set -o pipefail
+# Détection automatique du projet ou du workspace
+if [ -d ".xcworkspace" ]; then
+WORKSPACE=(basename *.xcworkspace)
+SCHEME=(xcodebuild -workspace "$WORKSPACE" -list | grep -A 10 "Schemes:" | tail -n +2 | head -n 1 | xargs)
+echo "Building workspace WORKSPACE with schemeSCHEME"
+xcodebuild archive 
+-workspace "$WORKSPACE" 
+-scheme "$SCHEME" 
+-sdk iphoneos 
+-configuration Release 
+-archivePath build/PalApp.xcarchive 
+CODE_SIGNING_ALLOWED=NO 
+CODE_SIGNING_REQUIRED=NO 
+CODE_SIGN_IDENTITY="" 
+CODE_SIGN_ENTITLEMENTS=""
+elif [ -d ".xcodeproj" ]; then
+PROJECT=(basename *.xcodeproj)
+SCHEME=(xcodebuild -project "$PROJECT" -list | grep -A 10 "Schemes:" | tail -n +2 | head -n 1 | xargs)
+echo "Building project PROJECT with schemeSCHEME"
+xcodebuild archive 
+-project "$PROJECT" 
+-scheme "$SCHEME" 
+-sdk iphoneos 
+-configuration Release 
+-archivePath build/PalApp.xcarchive 
+CODE_SIGNING_ALLOWED=NO 
+CODE_SIGNING_REQUIRED=NO 
+CODE_SIGN_IDENTITY="" 
+CODE_SIGN_ENTITLEMENTS=""
+else
+echo "Aucun fichier .xcodeproj ou .xcworkspace trouvé !"
+exit 1
+fi
+- name: Package IPA
+run: |
+mkdir -p build/Payload
+cp -R build/PalApp.xcarchive/Products/Applications/*.app build/Payload/
+cd build
+zip -r PalApp.ipa Payload
+echo "IPA créé avec succès dans build/PalApp.ipa"
+- name: Upload IPA Artifact
+uses: actions/upload-artifact@v4
+with:
+name: PalApp-unsigned-ipa
+path: build/PalApp.ipa
+retention-days: 14
