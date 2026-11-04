@@ -1,0 +1,22 @@
+name: Build IPA
+on: { workflow_dispatch: {}, push: { branches: [main] } }
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: llama.xcframework
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release download --repo ggml-org/llama.cpp --pattern '*xcframework*.zip' --dir dl
+          unzip -q dl/*.zip -d dl/x
+          cp -R "$(find dl/x -name llama.xcframework -maxdepth 4 | head -1)" .
+      - run: brew install xcodegen && xcodegen generate
+      - name: Build
+        run: |
+          xcodebuild -project Pal.xcodeproj -scheme Pal -configuration Release -sdk iphoneos \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          mkdir Payload && cp -R build/Build/Products/Release-iphoneos/Pal.app Payload/
+          zip -qr Pal.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with: { name: Pal-ipa, path: Pal.ipa }
