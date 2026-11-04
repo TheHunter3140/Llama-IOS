@@ -1,0 +1,39 @@
+name: Pal
+options:
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  bundleIdPrefix: com.local
+
+targets:
+  Pal:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    dependencies:
+      - framework: llama.xcframework
+        embed: true
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Pal
+        CFBundleName: Pal
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.local.pal
+        PRODUCT_NAME: Pal
+        SWIFT_VERSION: "5.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: "YES"
+        ENABLE_BITCODE: "NO"
+        SWIFT_STRICT_CONCURRENCY: minimal
+      configs:
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
