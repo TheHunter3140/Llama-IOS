@@ -26,6 +26,11 @@ jobs:
           mv "$FW" ./llama.xcframework
           ls -la llama.xcframework
 
+      - name: Vérifier les fichiers du projet
+        run: |
+          test -f project.yml || { echo "project.yml manquant à la racine"; exit 1; }
+          ls Sources
+
       - name: Installer XcodeGen
         run: brew install xcodegen
 
@@ -34,6 +39,7 @@ jobs:
 
       - name: Compiler (sans signature)
         run: |
+          set -o pipefail
           xcodebuild \
             -project Pal.xcodeproj \
             -scheme Pal \
@@ -44,7 +50,13 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            build 2>&1 | tee build.log
+
+      - name: Afficher les erreurs de compilation
+        if: failure()
+        run: |
+          echo "=== ERREURS ==="
+          grep -n -E "error:|ld: |Undefined symbol" build.log | sort -u | head -n 40
 
       - name: Créer l'IPA
         run: |
@@ -52,8 +64,16 @@ jobs:
           cp -R build/Build/Products/Release-iphoneos/Pal.app Payload/
           zip -qry Pal.ipa Payload
 
-      - name: Publier l'artefact
+      - name: Publier l'IPA
         uses: actions/upload-artifact@v4
         with:
           name: Pal-ipa-unsigned
           path: Pal.ipa
+
+      - name: Publier le log de compilation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
