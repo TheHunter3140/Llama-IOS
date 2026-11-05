@@ -163,7 +163,7 @@ final class Engine: @unchecked Sendable {
             llama_sampler_chain_add(sampler, greedy)
         } else {
             let penalty = llama_sampler_init_penalties(
-                64, Float(cfg.repeatPen), 0, 0
+                llama_vocab_n_tokens(vocabulary), 64, Float(cfg.repeatPen), 0, 0
             )
             let topK = llama_sampler_init_top_k(Int32(max(1, cfg.topK)))
             let topP = llama_sampler_init_top_p(Float(cfg.topP), 1)
