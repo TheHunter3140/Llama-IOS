@@ -9,6 +9,7 @@ targets:
   Pal:
     type: application
     platform: iOS
+    deploymentTarget: "16.4"
     sources:
       - path: Sources
     dependencies:
@@ -19,6 +20,8 @@ targets:
       properties:
         CFBundleDisplayName: Pal
         CFBundleName: Pal
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
@@ -29,9 +32,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.local.pal
         PRODUCT_NAME: Pal
         SWIFT_VERSION: "5.0"
-        IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        IPHONEOS_DEPLOYMENT_TARGET: "16.4"
         TARGETED_DEVICE_FAMILY: "1"
-        GENERATE_INFOPLIST_FILE: "YES"
         ENABLE_BITCODE: "NO"
         SWIFT_STRICT_CONCURRENCY: minimal
       configs:
