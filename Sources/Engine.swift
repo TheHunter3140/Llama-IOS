@@ -54,7 +54,6 @@ final class Engine: @unchecked Sendable {
 
         var modelParams = llama_model_default_params()
         modelParams.n_gpu_layers = Int32(max(0, cfg.gpuLayers))
-        modelParams.use_mmap = mmap
 
         let loadedModel: OpaquePointer? = path.withCString { cPath in
             llama_model_load_from_file(cPath, modelParams)
