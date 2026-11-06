@@ -2,7 +2,64 @@ import SwiftUI
 import UIKit
 import AVFoundation
 
-struct SettingsView: View {
+struct SettingsTab: View {
+    @State private var showSkills = false
+    @State private var showResearch = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Général") {
+                    NavigationLink { SettingsDetail(kind: .appearance) } label: {
+                        Label("Apparence et texte", systemImage: "paintpalette")
+                    }
+                    NavigationLink { SettingsDetail(kind: .voice) } label: {
+                        Label("Voix", systemImage: "speaker.wave.2")
+                    }
+                    NavigationLink { SettingsDetail(kind: .prompt) } label: {
+                        Label("Prompt système", systemImage: "text.quote")
+                    }
+                }
+                Section("Modèle") {
+                    NavigationLink { SettingsDetail(kind: .performance) } label: {
+                        Label("Performance", systemImage: "bolt")
+                    }
+                    NavigationLink { SettingsDetail(kind: .memory) } label: {
+                        Label("Modèles et mémoire", systemImage: "memorychip")
+                    }
+                    NavigationLink { SettingsDetail(kind: .sampling) } label: {
+                        Label("Paramètres du modèle", systemImage: "slider.horizontal.3")
+                    }
+                }
+                Section("Outils") {
+                    Button { showSkills = true } label: {
+                        Label("Compétences", systemImage: "sparkles")
+                    }
+                    Button { showResearch = true } label: {
+                        Label("Recherche Web", systemImage: "globe")
+                    }
+                    NavigationLink { DownloadsView() } label: {
+                        Label("Hugging Face", systemImage: "arrow.down.circle")
+                    }
+                }
+                Section("Plus") {
+                    NavigationLink { SettingsDetail(kind: .data) } label: {
+                        Label("Données et confidentialité", systemImage: "lock")
+                    }
+                }
+            }
+            .navigationTitle("Réglages")
+            .sheet(isPresented: $showSkills) { SkillsView() }
+            .sheet(isPresented: $showResearch) { ResearchView() }
+            .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 72) }
+        }
+    }
+}
+
+struct SettingsDetail: View {
+    enum Kind { case appearance, voice, prompt, performance, memory, sampling, data }
+
+    let kind: Kind
     @EnvironmentObject private var vm: VM
     @Environment(\.dismiss) private var dismiss
     @State private var voices: [AVSpeechSynthesisVoice] = []
@@ -15,23 +72,84 @@ struct SettingsView: View {
     ]
 
     var body: some View {
-        NavigationStack {
-            Form {
-                perfSection
-                modelsMemorySection
-                voiceSection
-                promptSection
-                samplingSection
-                appearanceSection
-                dataSection
-            }
-            .navigationTitle("Réglages")
+        Form { content }
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .onAppear { voices = Speaker.voices() }
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("OK") { dismiss() }
+    }
+
+    private var title: String {
+        switch kind {
+        case .appearance: return "Apparence et texte"
+        case .voice: return "Voix"
+        case .prompt: return "Prompt système"
+        case .performance: return "Performance"
+        case .memory: return "Modèles et mémoire"
+        case .sampling: return "Paramètres du modèle"
+        case .data: return "Données"
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        switch kind {
+        case .appearance: appearanceSection
+        case .voice: voiceSection
+        case .prompt: promptSection
+        case .performance: perfSection
+        case .memory: modelsMemorySection
+        case .sampling: samplingSection
+        case .data: dataSection
+        }
+    }
+
+    // MARK: apparence
+
+    private var fontDesignBinding: Binding<Int> {
+        Binding(get: { vm.prefs.fontDesign }, set: { vm.prefs.fontDesign = $0 })
+    }
+
+    private var appearanceSection: some View {
+        Group {
+            Section("Thème") {
+                Picker("Thème", selection: $vm.cfg.theme) {
+                    Text("Auto").tag(0)
+                    Text("Clair").tag(1)
+                    Text("Sombre").tag(2)
                 }
+                .pickerStyle(.segmented)
+                ColorPicker(
+                    "Couleur d'accent",
+                    selection: Binding(get: { vm.cfg.accent }, set: { vm.cfg.setAccent($0) })
+                )
+            }
+            Section {
+                Picker("Police", selection: fontDesignBinding) {
+                    Text("Système").tag(0)
+                    Text("Arrondie").tag(1)
+                    Text("Serif").tag(2)
+                    Text("Mono").tag(3)
+                }
+                .pickerStyle(.segmented)
+                sliderRow("Taille du texte", $vm.cfg.fontSize, 12...26, 1)
+                Text("Aperçu : le discriminant vaut b² − 4ac. Voici un texte pour vérifier la lisibilité.")
+                    .font(.system(size: vm.cfg.fontSize, design: vm.fontDesign))
+                    .padding(.vertical, 4)
+            } header: {
+                Text("Texte des messages")
+            }
+            Section {
+                Picker("Réflexion", selection: $vm.prefs.thinkDisplay) {
+                    Text("Repliée").tag(0)
+                    Text("Visible").tag(1)
+                    Text("Masquée").tag(2)
+                }
+                .pickerStyle(.segmented)
+                Toggle("Retour haptique", isOn: $vm.cfg.haptics)
+                Toggle("Écran allumé pendant la génération", isOn: $vm.cfg.keepAwake)
+            } header: {
+                Text("Comportement")
+            } footer: {
+                Text("La réflexion concerne les modèles comme DeepSeek R1 qui « pensent » avant de répondre.")
             }
         }
     }
@@ -39,10 +157,7 @@ struct SettingsView: View {
     // MARK: performance
 
     private var gpuBinding: Binding<Bool> {
-        Binding(
-            get: { vm.cfg.gpuLayers > 0 },
-            set: { vm.cfg.gpuLayers = $0 ? 99 : 0 }
-        )
+        Binding(get: { vm.cfg.gpuLayers > 0 }, set: { vm.cfg.gpuLayers = $0 ? 99 : 0 })
     }
 
     private func profileCard(_ profile: PerfProfile) -> some View {
@@ -92,12 +207,8 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Toggle(isOn: gpuBinding) {
-                Label("GPU Metal", systemImage: "cpu")
-            }
-            Toggle(isOn: $vm.prefs.mmap) {
-                Label("Lecture mmap (économise la RAM)", systemImage: "memorychip")
-            }
+            Toggle(isOn: gpuBinding) { Label("GPU Metal", systemImage: "cpu") }
+            Toggle(isOn: $vm.prefs.mmap) { Label("Lecture mmap", systemImage: "memorychip") }
             Toggle(isOn: $vm.prefs.thermalGuard) {
                 Label("Protection thermique et batterie", systemImage: "thermometer.medium")
             }
@@ -124,8 +235,6 @@ struct SettingsView: View {
                     Label("Appliquer et recharger le modèle", systemImage: "arrow.triangle.2.circlepath")
                 }
             }
-        } header: {
-            Text("Performance")
         } footer: {
             Text("Le GPU Metal est expérimental sur les iPhone à peu de RAM : désactive-le si le chargement échoue. Contexte, GPU et mmap demandent de recharger le modèle ; les threads s'appliquent au prochain message.")
         }
@@ -134,17 +243,11 @@ struct SettingsView: View {
     // MARK: modèles et mémoire
 
     private var launchModelBinding: Binding<String> {
-        Binding(
-            get: { vm.prefs.launchModelID ?? "" },
-            set: { vm.prefs.launchModelID = $0.isEmpty ? nil : $0 }
-        )
+        Binding(get: { vm.prefs.launchModelID ?? "" }, set: { vm.prefs.launchModelID = $0.isEmpty ? nil : $0 })
     }
 
     private var newChatBinding: Binding<String> {
-        Binding(
-            get: { vm.prefs.newChatModelID ?? "" },
-            set: { vm.prefs.newChatModelID = $0.isEmpty ? nil : $0 }
-        )
+        Binding(get: { vm.prefs.newChatModelID ?? "" }, set: { vm.prefs.newChatModelID = $0.isEmpty ? nil : $0 })
     }
 
     private var modelsMemorySection: some View {
@@ -183,20 +286,15 @@ struct SettingsView: View {
                 Label("Décharger le modèle maintenant", systemImage: "eject")
             }
             .disabled(!vm.engine.loaded || vm.generating || vm.loading)
-        } header: {
-            Text("Modèles et mémoire")
         } footer: {
-            Text("Chaque discussion garde son modèle. Un modèle déchargé libère la RAM et se recharge tout seul à l'envoi du prochain message. « À la demande » garde l'app très légère au démarrage.")
+            Text("Chaque discussion garde son modèle. Un modèle déchargé libère la RAM et se recharge tout seul à l'envoi du prochain message.")
         }
     }
 
     // MARK: voix
 
     private var voiceBinding: Binding<String> {
-        Binding(
-            get: { vm.prefs.ttsVoice ?? "" },
-            set: { vm.prefs.ttsVoice = $0.isEmpty ? nil : $0 }
-        )
+        Binding(get: { vm.prefs.ttsVoice ?? "" }, set: { vm.prefs.ttsVoice = $0.isEmpty ? nil : $0 })
     }
 
     private var voiceSection: some View {
@@ -217,28 +315,24 @@ struct SettingsView: View {
             } label: {
                 Label("Tester la voix", systemImage: "speaker.wave.2")
             }
-        } header: {
-            Text("Voix (lecture à voix haute)")
         } footer: {
-            Text("Pour de meilleures voix : Réglages iOS › Accessibilité › Contenu énoncé › Voix. Dans le chat, touche le haut-parleur sous une réponse pour l'écouter.")
+            Text("Pour de meilleures voix : Réglages iOS › Accessibilité › Contenu énoncé › Voix.")
         }
     }
 
-    // MARK: prompt, échantillonnage, apparence, données
+    // MARK: prompt, échantillonnage, données
 
     private var promptSection: some View {
-        Section(
-            header: Text("Prompt système"),
-            footer: Text("S'applique au prochain message après rechargement du modèle.")
-        ) {
+        Section {
             TextEditor(text: $vm.cfg.system)
-                .frame(minHeight: 90)
-                .accessibilityLabel("Instructions système personnalisées")
+                .frame(minHeight: 120)
             Menu("Préréglages") {
                 ForEach(presets, id: \.0) { preset in
                     Button(preset.0) { vm.cfg.system = preset.1 }
                 }
             }
+        } footer: {
+            Text("Utilisé quand la discussion n'a pas de personnage. Il s'applique au prochain message.")
         }
     }
 
@@ -252,33 +346,11 @@ struct SettingsView: View {
         }
     }
 
-    private var appearanceSection: some View {
-        Section("Apparence") {
-            Picker("Thème", selection: $vm.cfg.theme) {
-                Text("Auto").tag(0)
-                Text("Clair").tag(1)
-                Text("Sombre").tag(2)
-            }
-            .pickerStyle(.segmented)
-
-            ColorPicker(
-                "Couleur d'accent",
-                selection: Binding(
-                    get: { vm.cfg.accent },
-                    set: { vm.cfg.setAccent($0) }
-                )
-            )
-            sliderRow("Taille du texte", $vm.cfg.fontSize, 12...24, 1)
-            Toggle("Retour haptique", isOn: $vm.cfg.haptics)
-            Toggle("Écran allumé pendant la génération", isOn: $vm.cfg.keepAwake)
-        }
-    }
-
     private var dataSection: some View {
-        Section("Données et confidentialité") {
+        Section {
             Text("Les conversations restent stockées localement sur l'iPhone. Les modèles du dossier Pal sont lus sur place ; ceux choisis via le sélecteur sont lus à leur emplacement d'origine (ou copiés en secours).")
                 .font(.caption)
-            Button("Supprimer cette discussion", role: .destructive) {
+            Button("Supprimer la discussion actuelle", role: .destructive) {
                 vm.deleteChat(vm.currentChatID)
             }
             .disabled(vm.generating || vm.loading || vm.messages.isEmpty)
