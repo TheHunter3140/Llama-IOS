@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-struct ModelsView: View {
+struct ModelsTab: View {
     private enum ImportTarget {
         case model
         case mmproj(UUID)
@@ -10,65 +10,80 @@ struct ModelsView: View {
     }
 
     @EnvironmentObject private var vm: VM
-    @Environment(\.dismiss) private var dismiss
     @State private var picking = false
     @State private var target = ImportTarget.model
-    @State private var importMessage: String?
+    @State private var message: String?
     @State private var deleting: ModelEntry?
+    @State private var showDownloads = false
 
     var body: some View {
         NavigationStack {
             List {
                 modelsSection
-                addSection
                 memorySection
             }
             .navigationTitle("Modèles")
-            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("OK") { dismiss() }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button {
+                            showDownloads = true
+                        } label: {
+                            Label("Télécharger depuis Hugging Face", systemImage: "arrow.down.circle")
+                        }
+                        Button {
+                            vm.scanLibrary()
+                            message = "Dossier analysé : \(vm.models.count) modèle(s)."
+                        } label: {
+                            Label("Analyser le dossier Pal", systemImage: "arrow.clockwise")
+                        }
+                        Button {
+                            target = .model
+                            picking = true
+                        } label: {
+                            Label("Ajouter depuis Fichiers", systemImage: "folder")
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .accessibilityLabel("Ajouter un modèle")
                 }
             }
+            .navigationDestination(isPresented: $showDownloads) { DownloadsView() }
             .refreshable { vm.scanLibrary() }
+            .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 72) }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.data]) { result in
                 switch result {
                 case .failure(let error):
-                    importMessage = "Sélection impossible : \(error.localizedDescription)"
+                    message = "Sélection impossible : \(error.localizedDescription)"
                 case .success(let url):
                     switch target {
                     case .model:
                         if vm.addModel(url) || vm.importModelCopy(url) {
-                            dismiss()
+                            message = "Modèle ajouté."
                         } else {
-                            importMessage = vm.status
+                            message = vm.status
                         }
                     case .mmproj(let id):
                         vm.addMMProj(url, to: id)
-                        importMessage = vm.status
+                        message = vm.status
                     case .replace(let id):
                         vm.relinkModel(url, id: id)
-                        importMessage = vm.status
+                        message = vm.status
                     }
                 }
             }
             .alert(
                 "Modèles",
-                isPresented: Binding(
-                    get: { importMessage != nil },
-                    set: { if !$0 { importMessage = nil } }
-                )
+                isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })
             ) {
                 Button("OK", role: .cancel) {}
             } message: {
-                Text(importMessage ?? "")
+                Text(message ?? "")
             }
             .confirmationDialog(
                 "Supprimer ce modèle du téléphone ?",
-                isPresented: Binding(
-                    get: { deleting != nil },
-                    set: { if !$0 { deleting = nil } }
-                ),
+                isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
                 titleVisibility: .visible
             ) {
                 Button("Supprimer le fichier", role: .destructive) {
@@ -82,51 +97,23 @@ struct ModelsView: View {
         }
     }
 
-    // MARK: sections
-
     private var modelsSection: some View {
         Section {
             if vm.models.isEmpty {
-                Text("Aucun modèle pour l'instant. Dépose un .gguf dans Fichiers › Sur mon iPhone › Pal › Models : il apparaît ici tout seul. Tu peux aussi en télécharger un.")
+                Text("Aucun modèle pour l'instant. Dépose un .gguf dans Fichiers › Sur mon iPhone › Pal › Models : il apparaît ici tout seul. Tu peux aussi en télécharger un avec le bouton +.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             ForEach(vm.models) { model in
                 row(model)
             }
-        } header: {
-            Text("Mes modèles")
-        }
-    }
-
-    private var addSection: some View {
-        Section {
-            NavigationLink {
-                DownloadsView()
-            } label: {
-                Label("Télécharger depuis Hugging Face", systemImage: "arrow.down.circle")
-            }
-            Button {
-                vm.scanLibrary()
-                importMessage = "Dossier analysé : \(vm.models.count) modèle(s) et \(vm.skills.filter { $0.id.hasPrefix("file:") }.count) compétence(s) du dossier."
-            } label: {
-                Label("Analyser le dossier Pal", systemImage: "arrow.clockwise")
-            }
-            Button {
-                target = .model
-                picking = true
-            } label: {
-                Label("Ajouter depuis Fichiers (sélecteur)", systemImage: "folder")
-            }
-        } header: {
-            Text("Ajouter un modèle")
         } footer: {
-            Text("Méthode 1 (automatique) : glisse tes fichiers dans Fichiers › Sur mon iPhone › Pal › Models. Les .gguf sont reconnus et un fichier « mmproj » est associé au modèle qui lui correspond. Les .md ou .txt placés dans « Skills » deviennent des compétences. Méthode 2 : le sélecteur ci-dessus, qui lit le fichier sans le copier (ou le copie en secours).")
+            Text("Les .gguf du dossier Models sont reconnus automatiquement, et un fichier « mmproj » est associé au modèle qui lui correspond. Les .md ou .txt du dossier Skills deviennent des compétences.")
         }
     }
 
     private var memorySection: some View {
-        Section {
+        Section("Mémoire") {
             Button {
                 vm.unloadModel()
             } label: {
@@ -136,84 +123,71 @@ struct ModelsView: View {
             Text(vm.status)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-        } header: {
-            Text("Mémoire")
         }
     }
 
-    // MARK: ligne de modèle
+    private func isDefault(_ model: ModelEntry) -> Bool {
+        vm.prefs.newChatModelID == model.id.uuidString
+            || (vm.prefs.launchMode == 2 && vm.prefs.launchModelID == model.id.uuidString)
+    }
 
-    private func chip(_ text: String, _ icon: String) -> some View {
-        Label(text, systemImage: icon)
-            .font(.caption2)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(Color(.tertiarySystemFill), in: Capsule())
+    private func sizeText(_ mb: Int) -> String {
+        mb >= 1024 ? String(format: "%.1f Go", Double(mb) / 1024) : "\(mb) Mo"
     }
 
     private func row(_ model: ModelEntry) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(model.name)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(2)
-                Spacer()
-                if vm.currentID == model.id {
-                    Image(systemName: vm.engine.loaded ? "checkmark.circle.fill" : "circle.dashed")
-                        .foregroundStyle(vm.cfg.accent)
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(model.name)
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if isDefault(model) {
+                        Text("Par défaut")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .overlay(Capsule().stroke(Color.secondary.opacity(0.5), lineWidth: 1))
+                    }
                 }
+                HStack(spacing: 6) {
+                    Text("GGUF · \(sizeText(model.sizeMB)) · \(model.relPath == nil ? "Lié" : "Dossier")")
+                    if model.mmprojName != nil { Text("· mmproj") }
+                    if vm.currentID == model.id {
+                        Image(systemName: vm.engine.loaded ? "checkmark.circle.fill" : "circle.dashed")
+                            .foregroundStyle(vm.cfg.accent)
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            HStack(spacing: 6) {
-                Text("\(model.sizeMB) Mo")
-                    .font(.caption)
+            Spacer(minLength: 4)
+            Menu {
+                Button("Utiliser pour cette discussion") { vm.select(model) }
+                Button("Par défaut pour les nouvelles discussions") { vm.setNewChatModel(model) }
+                Button("Charger au lancement de l'app") { vm.setLaunchModel(model) }
+                Button("Associer un fichier mmproj…") {
+                    target = .mmproj(model.id)
+                    picking = true
+                }
+                if model.relPath == nil {
+                    Button("Relier à un autre fichier…") {
+                        target = .replace(model.id)
+                        picking = true
+                    }
+                    Button("Retirer de la liste", role: .destructive) { vm.remove(model) }
+                } else {
+                    Button("Supprimer le fichier", role: .destructive) { deleting = model }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 17))
                     .foregroundStyle(.secondary)
-                if model.mmprojName != nil { chip("mmproj", "eye") }
-                if vm.prefs.launchMode == 2 && vm.prefs.launchModelID == model.id.uuidString {
-                    chip("lancement", "power")
-                }
-                if vm.prefs.newChatModelID == model.id.uuidString {
-                    chip("nouvelles", "plus.bubble")
-                }
-                if model.relPath == nil { chip("Fichiers", "folder") }
+                    .frame(width: 36, height: 36)
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture {
-            vm.select(model)
-            dismiss()
-        }
-        .contextMenu {
-            Button("Utiliser pour cette discussion") {
-                vm.select(model)
-                dismiss()
-            }
-            Button("Charger au lancement de l'app") { vm.setLaunchModel(model) }
-            Button("Par défaut pour les nouvelles discussions") { vm.setNewChatModel(model) }
-            Button("Associer un fichier mmproj…") {
-                target = .mmproj(model.id)
-                picking = true
-            }
-            if model.relPath == nil {
-                Button("Relier à un autre fichier…") {
-                    target = .replace(model.id)
-                    picking = true
-                }
-            }
-        }
-        .swipeActions {
-            if model.relPath != nil {
-                Button(role: .destructive) {
-                    deleting = model
-                } label: {
-                    Label("Supprimer", systemImage: "trash")
-                }
-            } else {
-                Button(role: .destructive) {
-                    vm.remove(model)
-                } label: {
-                    Label("Retirer", systemImage: "minus.circle")
-                }
-            }
-        }
+        .onTapGesture { vm.select(model) }
     }
 }
