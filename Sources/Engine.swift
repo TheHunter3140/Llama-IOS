@@ -49,11 +49,12 @@ final class Engine: @unchecked Sendable {
     }
 
     @discardableResult
-    func load(path: String, cfg: Cfg) -> Bool {
+    func load(path: String, cfg: Cfg, mmap: Bool = true) -> Bool {
         unload()
 
         var modelParams = llama_model_default_params()
         modelParams.n_gpu_layers = Int32(max(0, cfg.gpuLayers))
+        modelParams.use_mmap = mmap
 
         let loadedModel: OpaquePointer? = path.withCString { cPath in
             llama_model_load_from_file(cPath, modelParams)
@@ -92,6 +93,13 @@ final class Engine: @unchecked Sendable {
             Double(llama_model_size(loadedModel)) / 1_000_000_000
         )
         return true
+    }
+
+    /// Ajuste le nombre de threads à chaud (protection thermique / économie d'énergie).
+    func setThreads(_ count: Int) {
+        guard let context = ctx else { return }
+        let n = Int32(max(1, count))
+        llama_set_n_threads(context, n, n)
     }
 
     func unload() {
