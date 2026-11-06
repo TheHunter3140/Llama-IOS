@@ -5,6 +5,11 @@ options:
   createIntermediateGroups: true
   bundleIdPrefix: com.local
 
+packages:
+  SwiftMath:
+    url: https://github.com/mgriebling/SwiftMath
+    from: 1.6.0
+
 targets:
   Pal:
     type: application
@@ -15,6 +20,7 @@ targets:
     dependencies:
       - framework: llama.xcframework
         embed: true
+      - package: SwiftMath
     info:
       path: Info.plist
       properties:
