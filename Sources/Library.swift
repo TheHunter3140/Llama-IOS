@@ -61,6 +61,7 @@ struct Conversation: Identifiable, Codable {
     var modelID: UUID? = nil
     var messages: [Msg] = []
     var updated = Date()
+    var personaID: String? = nil
 }
 
 /// Réglages ajoutés après coup. Décodage tolérant : les anciens réglages restent valides.
@@ -76,10 +77,13 @@ struct Prefs: Codable, Equatable {
     var ttsVoice: String? = nil
     var ttsRate = 0.5
     var wifiOnly = true
+    var fontDesign = 0               // 0 système, 1 arrondi, 2 serif, 3 mono
+    var thinkDisplay = 0             // 0 repliée, 1 visible, 2 masquée
 
     enum CodingKeys: String, CodingKey {
         case mmap, thermalGuard, launchMode, launchModelID, newChatModelID
         case autoUnloadMinutes, unloadInBackground, ttsAuto, ttsVoice, ttsRate, wifiOnly
+        case fontDesign, thinkDisplay
     }
 
     init() {}
@@ -97,6 +101,8 @@ struct Prefs: Codable, Equatable {
         ttsVoice = try c.decodeIfPresent(String.self, forKey: .ttsVoice)
         ttsRate = try c.decodeIfPresent(Double.self, forKey: .ttsRate) ?? 0.5
         wifiOnly = try c.decodeIfPresent(Bool.self, forKey: .wifiOnly) ?? true
+        fontDesign = try c.decodeIfPresent(Int.self, forKey: .fontDesign) ?? 0
+        thinkDisplay = try c.decodeIfPresent(Int.self, forKey: .thinkDisplay) ?? 0
     }
 }
 
