@@ -1,4 +1,4 @@
-# Pal Llama-IOS IA locale iOS
+# Pal Llama-IOS IA local
 
 Pal est une application iOS SwiftUI construite autour de `llama.cpp` et de modèles GGUF locaux.
 
