@@ -2,14 +2,27 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        DownloadManager.backgroundCompletion = completionHandler
+        DownloadManager.shared.activate()
+    }
+}
+
 @main
 struct PalApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var vm = VM()
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(vm)
+                .environmentObject(vm.speaker)
                 .tint(vm.cfg.accent)
                 .preferredColorScheme(vm.cfg.scheme)
         }
@@ -18,12 +31,17 @@ struct PalApp: App {
 
 struct RootView: View {
     @EnvironmentObject private var vm: VM
+    @Environment(\.scenePhase) private var scenePhase
     @State private var sensors = false
     @State private var activeSheet: ActiveSheet?
 
     private enum ActiveSheet: String, Identifiable {
-        case models, settings, skills, research
+        case models, settings, skills, research, chats, downloads
         var id: String { rawValue }
+    }
+
+    private var canSend: Bool {
+        !vm.loading && !vm.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var body: some View {
@@ -34,81 +52,29 @@ struct RootView: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
-                ChatList()
+                ChatList(onDownload: { activeSheet = .downloads })
 
-                HStack(alignment: .bottom, spacing: 8) {
-                    TextField("Message", text: $vm.input, axis: .vertical)
-                        .lineLimit(1...5)
-                        .padding(10)
-                        .background(
-                            Color(.secondarySystemBackground),
-                            in: RoundedRectangle(cornerRadius: 18)
-                        )
-                        .submitLabel(.send)
-                        .onSubmit { vm.send() }
-
-                    Button {
-                        vm.generating ? vm.stop() : vm.send()
-                    } label: {
-                        Image(systemName: vm.generating ? "stop.circle.fill" : "arrow.up.circle.fill")
-                            .font(.system(size: 34))
-                    }
-                    .disabled(vm.loading || (!vm.generating && !vm.engine.loaded))
-                    .accessibilityLabel(vm.generating ? "Arrêter la génération" : "Envoyer")
-                }
-                .padding(.horizontal)
-                .padding(.vertical, 8)
+                inputBar
             }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Button { activeSheet = .models } label: {
-                        VStack(spacing: 0) {
-                            Text(vm.currentName)
-                                .font(.headline)
-                                .lineLimit(1)
-                            Text(vm.loading ? "Chargement du modèle…" : (vm.generating
-                                ? String(format: "%.1f t/s", vm.stats.genTps)
-                                : vm.status))
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                }
+                ToolbarItem(placement: .principal) { header }
 
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) { sensors.toggle() }
-                    } label: {
-                        Image(systemName: "gauge.with.dots.needle.bottom.50percent")
+                    Button { activeSheet = .chats } label: {
+                        Image(systemName: "text.bubble")
                     }
-                    .accessibilityLabel("Statistiques")
+                    .accessibilityLabel("Discussions")
                 }
 
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     Button { vm.newChat() } label: {
                         Image(systemName: "square.and.pencil")
                     }
-                    .disabled(vm.generating)
-                    .accessibilityLabel("Nouvelle conversation")
+                    .disabled(vm.generating || vm.loading)
+                    .accessibilityLabel("Nouvelle discussion")
 
-                    ShareLink(item: vm.exportedMarkdown, subject: Text("Conversation Pal")) {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                    .disabled(vm.messages.isEmpty)
-                    .accessibilityLabel("Exporter la conversation en Markdown")
-
-                    Button { activeSheet = .research } label: {
-                        Image(systemName: "globe")
-                    }
-                    .accessibilityLabel("Recherche Web")
-
-                    Button { activeSheet = .skills } label: {
-                        Image(systemName: "sparkles")
-                    }
-                    .accessibilityLabel("Compétences Pal")
+                    menu
 
                     Button { activeSheet = .settings } label: {
                         Image(systemName: "slider.horizontal.3")
@@ -122,25 +88,123 @@ struct RootView: View {
                 case .settings: SettingsView()
                 case .skills: SkillsView()
                 case .research: ResearchView()
+                case .chats: ChatsView()
+                case .downloads: NavigationStack { DownloadsView() }
+                }
+            }
+            .onChange(of: scenePhase) { phase in
+                vm.scenePhaseChanged(phase)
+            }
+            .onChange(of: vm.requestModelPicker) { requested in
+                if requested {
+                    vm.requestModelPicker = false
+                    activeSheet = .models
                 }
             }
         }
+    }
+
+    private var header: some View {
+        Button { activeSheet = .models } label: {
+            VStack(spacing: 0) {
+                HStack(spacing: 4) {
+                    Text(vm.currentName)
+                        .font(.headline)
+                        .lineLimit(1)
+                    if vm.loading {
+                        ProgressView().scaleEffect(0.65)
+                    } else {
+                        Image(systemName: "chevron.down")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(vm.loading ? "Chargement du modèle…" : (vm.generating
+                    ? String(format: "%.1f t/s", vm.stats.genTps)
+                    : vm.status))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var menu: some View {
+        Menu {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { sensors.toggle() }
+            } label: {
+                Label(sensors ? "Masquer les statistiques" : "Statistiques", systemImage: "gauge.with.dots.needle.bottom.50percent")
+            }
+            Button { activeSheet = .research } label: {
+                Label("Recherche Web", systemImage: "globe")
+            }
+            Button { activeSheet = .skills } label: {
+                Label("Compétences", systemImage: "sparkles")
+            }
+            Button { activeSheet = .downloads } label: {
+                Label("Télécharger des modèles", systemImage: "arrow.down.circle")
+            }
+            if vm.engine.loaded {
+                Button { vm.unloadModel() } label: {
+                    Label("Décharger le modèle", systemImage: "eject")
+                }
+                .disabled(vm.generating || vm.loading)
+            }
+            ShareLink(item: vm.exportedMarkdown, subject: Text("Conversation Pal")) {
+                Label("Exporter en Markdown", systemImage: "square.and.arrow.up")
+            }
+            .disabled(vm.messages.isEmpty)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .accessibilityLabel("Plus d'options")
+    }
+
+    private var inputBar: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            TextField("Message", text: $vm.input, axis: .vertical)
+                .lineLimit(1...5)
+                .padding(10)
+                .background(
+                    Color(.secondarySystemBackground),
+                    in: RoundedRectangle(cornerRadius: 18)
+                )
+                .submitLabel(.send)
+                .onSubmit { vm.send() }
+
+            Button {
+                vm.generating ? vm.stop() : vm.send()
+            } label: {
+                Image(systemName: vm.generating ? "stop.circle.fill" : "arrow.up.circle.fill")
+                    .font(.system(size: 34))
+            }
+            .disabled(vm.loading || (!vm.generating && !canSend))
+            .accessibilityLabel(vm.generating ? "Arrêter la génération" : "Envoyer")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
     }
 }
 
 struct ChatList: View {
     @EnvironmentObject private var vm: VM
+    let onDownload: () -> Void
+
+    private let suggestions = [
+        "Explique-moi simplement ce concept :",
+        "Résume ce texte :",
+        "Aide-moi à écrire un message poli pour :",
+        "Corrige et explique cette erreur de code :"
+    ]
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 10) {
                     if vm.messages.isEmpty && vm.streaming == nil {
-                        Text(vm.models.isEmpty
-                             ? "Touche le titre pour ajouter un modèle .gguf"
-                             : "Écris un message pour commencer")
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 80)
+                        emptyState
                     }
 
                     ForEach(vm.messages) { message in
@@ -149,58 +213,143 @@ struct ChatList: View {
                             user: message.role == "user",
                             last: message.id == vm.messages.last?.id
                         )
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
 
                     if let response = vm.streaming {
-                        Bubble(text: response.isEmpty ? "…" : response, user: false, last: false)
+                        Bubble(text: response.isEmpty ? "…" : response, user: false, last: false, actions: false)
                     }
                     Color.clear.frame(height: 1).id("chat-end")
                 }
                 .padding()
+                .animation(.easeOut(duration: 0.2), value: vm.messages.count)
             }
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: vm.streaming) { _ in
-                withAnimation { proxy.scrollTo("chat-end", anchor: .bottom) }
+                proxy.scrollTo("chat-end", anchor: .bottom)
             }
             .onChange(of: vm.messages.count) { _ in
                 withAnimation { proxy.scrollTo("chat-end", anchor: .bottom) }
             }
         }
     }
+
+    private var emptyState: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 34))
+                .foregroundStyle(vm.cfg.accent)
+            Text(vm.models.isEmpty ? "Aucun modèle pour l'instant" : "Que veux-tu faire ?")
+                .font(.title3.weight(.semibold))
+
+            if vm.models.isEmpty {
+                Text("Dépose un fichier .gguf dans Fichiers › Sur mon iPhone › Pal › Models : il est reconnu automatiquement. Tu peux aussi en télécharger un depuis Hugging Face.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                Button("Télécharger un modèle") { onDownload() }
+                    .buttonStyle(.borderedProminent)
+            } else {
+                ForEach(suggestions, id: \.self) { text in
+                    Button { vm.input = text + " " } label: {
+                        Text(text)
+                            .font(.footnote)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.top, 50)
+        .padding(.horizontal, 8)
+    }
 }
 
 struct Bubble: View {
     @EnvironmentObject private var vm: VM
+    @EnvironmentObject private var speaker: Speaker
     let text: String
     let user: Bool
     let last: Bool
+    var actions = true
 
     var body: some View {
-        HStack {
+        HStack(alignment: .bottom) {
             if user { Spacer(minLength: 40) }
 
-            MarkdownMessage(text: text)
-                .font(.system(size: vm.cfg.fontSize))
-                .textSelection(.enabled)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    user ? vm.cfg.accent : Color(.secondarySystemBackground),
-                    in: RoundedRectangle(cornerRadius: 16)
-                )
-                .foregroundStyle(user ? Color.white : Color.primary)
-                .contextMenu {
-                    Button("Copier") { UIPasteboard.general.string = text }
-                    if last && !user {
-                        Button("Régénérer") { vm.regenerate() }
-                    }
-                    if user && !vm.generating && vm.messages.last(where: { $0.role == "user" })?.text == text {
-                        Button("Modifier") { vm.editLast() }
-                    }
+            VStack(alignment: user ? .trailing : .leading, spacing: 4) {
+                bubble
+                if !user && actions && !text.isEmpty {
+                    footer
                 }
+            }
 
             if !user { Spacer(minLength: 40) }
         }
+    }
+
+    private var isSpeaking: Bool { speaker.speakingText == text }
+
+    private func toggleSpeech() {
+        if isSpeaking {
+            speaker.stop()
+        } else {
+            speaker.speak(text, voiceID: vm.prefs.ttsVoice, rate: vm.prefs.ttsRate)
+        }
+    }
+
+    private var bubble: some View {
+        MarkdownMessage(text: text)
+            .font(.system(size: vm.cfg.fontSize))
+            .textSelection(.enabled)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                user ? vm.cfg.accent : Color(.secondarySystemBackground),
+                in: RoundedRectangle(cornerRadius: 16)
+            )
+            .foregroundStyle(user ? Color.white : Color.primary)
+            .contextMenu {
+                Button("Copier") { UIPasteboard.general.string = text }
+                if !user {
+                    Button(isSpeaking ? "Arrêter la lecture" : "Lire à voix haute") { toggleSpeech() }
+                }
+                if last && !user {
+                    Button("Régénérer") { vm.regenerate() }
+                }
+                if user && !vm.generating && vm.messages.last(where: { $0.role == "user" })?.text == text {
+                    Button("Modifier") { vm.editLast() }
+                }
+            }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 16) {
+            Button { toggleSpeech() } label: {
+                Image(systemName: isSpeaking ? "stop.circle.fill" : "speaker.wave.2")
+            }
+            .accessibilityLabel(isSpeaking ? "Arrêter la lecture" : "Lire à voix haute")
+
+            Button { UIPasteboard.general.string = text } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .accessibilityLabel("Copier")
+
+            if last {
+                Button { vm.regenerate() } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .disabled(vm.generating)
+                .accessibilityLabel("Régénérer")
+            }
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+        .buttonStyle(.plain)
+        .padding(.leading, 6)
     }
 }
 
@@ -281,197 +430,88 @@ struct SensorsPanel: View {
     }
 }
 
-struct ModelsView: View {
-    private enum ImportTarget {
-        case model
-        case mmproj(UUID)
-        case replace(UUID)
-    }
 
+struct ChatsView: View {
     @EnvironmentObject private var vm: VM
     @Environment(\.dismiss) private var dismiss
-    @State private var picking = false
-    @State private var target = ImportTarget.model
+    @State private var renaming: Conversation?
+    @State private var newTitle = ""
+
+    private var sorted: [Conversation] {
+        vm.conversations.sorted { $0.updated > $1.updated }
+    }
 
     var body: some View {
         NavigationStack {
             List {
-                ForEach(vm.models) { model in
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack {
-                            Text(model.name)
-                                .font(.subheadline.weight(.medium))
-                            Spacer()
-                            if vm.currentID == model.id {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(.tint)
-                            }
-                        }
-                        Text("\(model.sizeMB) Mo" + (model.mmprojName.map { " · mmproj : \($0)" } ?? ""))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        vm.select(model)
+                ForEach(sorted) { chat in
+                    Button {
+                        vm.openChat(chat.id)
                         dismiss()
+                    } label: {
+                        row(chat)
                     }
-                    .contextMenu {
-                        Button("Relier / remplacer le fichier GGUF") {
-                            target = .replace(model.id)
-                            picking = true
-                        }
-                        Button("Associer un mmproj (vision)") {
-                            target = .mmproj(model.id)
-                            picking = true
-                        }
-                    }
+                    .buttonStyle(.plain)
                     .swipeActions {
                         Button(role: .destructive) {
-                            vm.remove(model)
+                            vm.deleteChat(chat.id)
                         } label: {
-                            Label("Retirer", systemImage: "trash")
+                            Label("Supprimer", systemImage: "trash")
                         }
                     }
-                }
-
-                Section(footer: Text(
-                    "Les GGUF restent dans Fichiers : Pal conserve un signet au lieu de copier les gros modèles. " +
-                    "L'association mmproj est enregistrée, mais l'analyse d'images n'est pas encore implémentée."
-                )) {
-                    Button("Ajouter un modèle .gguf") {
-                        target = .model
-                        picking = true
-                    }
-                }
-            }
-            .navigationTitle("Modèles")
-            .navigationBarTitleDisplayMode(.inline)
-            .fileImporter(isPresented: $picking, allowedContentTypes: [.data]) { result in
-                guard case .success(let url) = result else { return }
-                switch target {
-                case .model:
-                    vm.addModel(url)
-                    dismiss()
-                case .mmproj(let id):
-                    vm.addMMProj(url, to: id)
-                case .replace(let id):
-                    vm.relinkModel(url, id: id)
-                }
-            }
-        }
-    }
-}
-
-struct SettingsView: View {
-    @EnvironmentObject private var vm: VM
-    @Environment(\.dismiss) private var dismiss
-
-    private let presets: [(String, String)] = [
-        ("Concis", "Tu es un assistant concis et précis. Réponds dans la langue de l'utilisateur."),
-        ("Maths", "Tu es un tuteur de mathématiques rigoureux. Donne la formule exacte puis le raisonnement étape par étape, sans inventer."),
-        ("Traducteur", "Tu es un traducteur FR↔EN. Traduis fidèlement, sans commentaire."),
-        ("Code", "Tu es un expert Python, HTML, CSS et JavaScript. Donne du code correct, commenté et court.")
-    ]
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section(
-                    header: Text("Prompt système"),
-                    footer: Text("S'applique au prochain message après rechargement du modèle.")
-                ) {
-                    TextEditor(text: $vm.cfg.system)
-                        .frame(minHeight: 90)
-                        .accessibilityLabel("Instructions système personnalisées")
-                    Menu("Préréglages") {
-                        ForEach(presets, id: \.0) { preset in
-                            Button(preset.0) { vm.cfg.system = preset.1 }
+                    .contextMenu {
+                        Button("Renommer") {
+                            newTitle = chat.title
+                            renaming = chat
                         }
+                        Button("Supprimer", role: .destructive) { vm.deleteChat(chat.id) }
                     }
-                }
-
-                Section("Profil iPhone / ressources") {
-                    Button("Économie mémoire (XR conseillé)") {
-                        vm.applyDevicePreset(.economy)
-                    }
-                    Button("Équilibré") {
-                        vm.applyDevicePreset(.balanced)
-                    }
-                    Text("Ces profils privilégient la stabilité. Le GPU Metal reste désactivé par défaut ; teste son activation modèle par modèle.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Section("Échantillonnage") {
-                    sliderRow("temperature", $vm.cfg.temp, 0...2, 0.05)
-                    sliderRow("top_p", $vm.cfg.topP, 0...1, 0.05)
-                    sliderRow("min_p", $vm.cfg.minP, 0...0.5, 0.01)
-                    sliderRow("repeat_penalty", $vm.cfg.repeatPen, 1...1.5, 0.01)
-                    Stepper("top_k : \(vm.cfg.topK)", value: $vm.cfg.topK, in: 1...200)
-                    Stepper("max tokens : \(vm.cfg.maxTokens)", value: $vm.cfg.maxTokens, in: 64...2048, step: 64)
-                }
-
-                Section(header: Text("Modèle (rechargement requis)")) {
-                    Stepper("n_ctx : \(vm.cfg.nCtx)", value: $vm.cfg.nCtx, in: 512...4096, step: 512)
-                    Stepper("n_batch : \(vm.cfg.nBatch)", value: $vm.cfg.nBatch, in: 32...512, step: 32)
-                    Stepper("threads : \(vm.cfg.threads)", value: $vm.cfg.threads, in: 1...8)
-                    Stepper("couches GPU (Metal) : \(vm.cfg.gpuLayers)", value: $vm.cfg.gpuLayers, in: 0...99, step: 4)
-                    Button("Appliquer et recharger") {
-                        vm.reload()
-                        dismiss()
-                    }
-                }
-
-                Section("Apparence") {
-                    Picker("Thème", selection: $vm.cfg.theme) {
-                        Text("Auto").tag(0)
-                        Text("Clair").tag(1)
-                        Text("Sombre").tag(2)
-                    }
-                    .pickerStyle(.segmented)
-
-                    ColorPicker(
-                        "Couleur d'accent",
-                        selection: Binding(
-                            get: { vm.cfg.accent },
-                            set: { vm.cfg.setAccent($0) }
-                        )
-                    )
-                    sliderRow("Taille du texte", $vm.cfg.fontSize, 12...24, 1)
-                    Toggle("Retour haptique", isOn: $vm.cfg.haptics)
-                    Toggle("Écran allumé pendant la génération", isOn: $vm.cfg.keepAwake)
-                }
-
-                Section("Données et confidentialité") {
-                    Text("Les modèles GGUF sélectionnés depuis Fichiers sont lus à leur emplacement d'origine : Pal ne les duplique pas dans son conteneur. Les conversations restent stockées localement sur l'iPhone.")
-                        .font(.caption)
-                    Button("Effacer la conversation actuelle", role: .destructive) {
-                        vm.newChat()
-                    }
-                    .disabled(vm.generating || vm.messages.isEmpty)
                 }
             }
-            .navigationTitle("Réglages")
+            .navigationTitle("Discussions")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        vm.newChat()
+                        dismiss()
+                    } label: {
+                        Label("Nouvelle", systemImage: "plus")
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("OK") { dismiss() }
                 }
             }
+            .alert(
+                "Renommer la discussion",
+                isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+            ) {
+                TextField("Titre", text: $newTitle)
+                Button("OK") {
+                    if let chat = renaming { vm.renameChat(chat.id, newTitle) }
+                    renaming = nil
+                }
+                Button("Annuler", role: .cancel) { renaming = nil }
+            }
         }
     }
 
-    private func sliderRow(
-        _ name: String,
-        _ value: Binding<Double>,
-        _ range: ClosedRange<Double>,
-        _ step: Double
-    ) -> some View {
-        VStack(alignment: .leading) {
-            Text("\(name) : \(String(format: "%.2f", value.wrappedValue))")
-                .font(.subheadline)
-            Slider(value: value, in: range, step: step)
+    private func row(_ chat: Conversation) -> some View {
+        let modelName = vm.models.first(where: { $0.id == chat.modelID })?.name ?? "Aucun modèle"
+        return HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(chat.title).font(.subheadline.weight(.medium)).lineLimit(1)
+                Text("\(modelName) · \(chat.messages.count) messages")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if chat.id == vm.currentChatID {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(vm.cfg.accent)
+            }
         }
+        .contentShape(Rectangle())
     }
 }
