@@ -2,25 +2,70 @@ name: Build Pal IPA (unsigned)
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version de l'app (ex : 1.0.0, chiffres et points uniquement)"
+        required: true
+        default: "1.0.0"
+      publish_release:
+        description: "Publier une release GitHub avec l'IPA"
+        type: boolean
+        default: true
+      prerelease:
+        description: "Marquer la release comme pré-version"
+        type: boolean
+        default: false
+      notes:
+        description: "Notes de version (optionnel)"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEPS_TAG: deps-1
+  LLAMA_ZIP: llama-b12130-xcframework.zip
 
 jobs:
   build:
     runs-on: macos-15
+    timeout-minutes: 30
     permissions:
-      contents: read
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Récupérer llama.xcframework depuis la release deps-1
+      - name: Déterminer la version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$INPUT_VERSION"
+          fi
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "Version invalide : '$VERSION' (attendu : 1, 1.0 ou 1.0.0)"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Version : $VERSION (build ${{ github.run_number }})"
+
+      - name: Récupérer llama.xcframework (release ${{ env.DEPS_TAG }})
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download deps-1 \
+          gh release download "$DEPS_TAG" \
             --repo "${{ github.repository }}" \
-            --pattern 'llama-b12130-xcframework.zip' \
+            --pattern "$LLAMA_ZIP" \
             --dir deps
-          unzip -q deps/llama-b12130-xcframework.zip -d deps/unzipped
+          unzip -q "deps/$LLAMA_ZIP" -d deps/unzipped
           FW=$(find deps/unzipped -name llama.xcframework -type d | head -n 1)
           test -n "$FW" || { echo "llama.xcframework introuvable dans le zip"; exit 1; }
           mv "$FW" ./llama.xcframework
@@ -29,7 +74,22 @@ jobs:
       - name: Vérifier les fichiers du projet
         run: |
           test -f project.yml || { echo "project.yml manquant à la racine"; exit 1; }
+          test -d Sources || { echo "Dossier Sources/ manquant"; exit 1; }
           ls Sources
+
+      - name: Générer l'icône de l'app
+        run: |
+          if [ -f tools/make_icon.py ]; then
+            python3 tools/make_icon.py || echo "Icône non générée : le build continue sans"
+          else
+            echo "tools/make_icon.py absent : pas d'icône personnalisée"
+          fi
+
+      - name: Injecter la version dans project.yml
+        run: |
+          sed -i '' -E "s/CFBundleShortVersionString: .*/CFBundleShortVersionString: \"$VERSION\"/" project.yml
+          sed -i '' -E "s/CFBundleVersion: .*/CFBundleVersion: \"${{ github.run_number }}\"/" project.yml
+          grep -n "CFBundle" project.yml
 
       - name: Installer XcodeGen
         run: brew install xcodegen
@@ -56,19 +116,50 @@ jobs:
         if: failure()
         run: |
           echo "=== ERREURS ==="
-          grep -n -E "error:|ld: |Undefined symbol" build.log | sort -u | head -n 40
+          grep -n -E "error:|ld: |Undefined symbol" build.log | sort -u | head -n 40 | tee errors.txt
+          {
+            echo "## Échec de la compilation"
+            echo '```'
+            cat errors.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Créer l'IPA
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/Pal.app Payload/
-          zip -qry Pal.ipa Payload
+          test -f Payload/Pal.app/Info.plist || { echo "Info.plist absent de l'app"; exit 1; }
+          echo "Frameworks embarqués :"
+          ls Payload/Pal.app/Frameworks 2>/dev/null || echo "(aucun)"
+          zip -qry "Pal-$VERSION.ipa" Payload
+          cp "Pal-$VERSION.ipa" Pal.ipa
+          shasum -a 256 "Pal-$VERSION.ipa" > "Pal-$VERSION.ipa.sha256"
+          ls -lh Pal*.ipa*
 
-      - name: Publier l'IPA
+      - name: Résumé du build
+        run: |
+          SIZE=$(du -h "Pal-$VERSION.ipa" | cut -f1)
+          SHA=$(cut -d' ' -f1 "Pal-$VERSION.ipa.sha256")
+          {
+            echo "## Pal $VERSION (build ${{ github.run_number }})"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Fichier | \`Pal-$VERSION.ipa\` |"
+            echo "| Taille | $SIZE |"
+            echo "| SHA-256 | \`$SHA\` |"
+            echo "| llama.cpp | \`$LLAMA_ZIP\` |"
+            echo "| iOS minimum | 16.4 |"
+            echo "| Commit | \`${GITHUB_SHA::7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publier l'IPA (artefact)
         uses: actions/upload-artifact@v4
         with:
           name: Pal-ipa-unsigned
-          path: Pal.ipa
+          path: |
+            Pal-${{ env.VERSION }}.ipa
+            Pal-${{ env.VERSION }}.ipa.sha256
 
       - name: Publier le log de compilation
         if: always()
@@ -77,3 +168,53 @@ jobs:
           name: build-log
           path: build.log
           if-no-files-found: ignore
+
+      - name: Créer ou mettre à jour la release GitHub
+        if: github.ref_type == 'tag' || inputs.publish_release == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_NOTES: ${{ inputs.notes }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          TAG="v$VERSION"
+          SHA=$(cut -d' ' -f1 "Pal-$VERSION.ipa.sha256")
+          {
+            echo "# Pal $VERSION"
+            echo ""
+            echo "IA locale pour iOS basée sur llama.cpp et des modèles GGUF."
+            echo ""
+            echo "## Installation"
+            echo "1. Télécharge \`Pal.ipa\` ci-dessous."
+            echo "2. **L'IPA n'est pas signé** : signe-le avec ta méthode de sideloading, puis installe-le."
+            echo "3. iOS 16.4 minimum."
+            echo ""
+            echo "## Vérification"
+            echo "SHA-256 de \`Pal-$VERSION.ipa\` :"
+            echo '```'
+            echo "$SHA"
+            echo '```'
+            echo ""
+            echo "Build ${{ github.run_number }}, commit \`${GITHUB_SHA::7}\`, moteur \`$LLAMA_ZIP\`."
+          } > notes.md
+          if [ -n "$INPUT_NOTES" ]; then
+            { echo ""; echo "## Notes"; printf '%s\n' "$INPUT_NOTES"; } >> notes.md
+          fi
+
+          FILES="Pal-$VERSION.ipa Pal.ipa Pal-$VERSION.ipa.sha256"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" $FILES --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            FLAGS=""
+            if [ "$INPUT_PRERELEASE" = "true" ]; then FLAGS="--prerelease"; else FLAGS="--latest"; fi
+            gh release create "$TAG" $FILES \
+              --title "Pal $VERSION (IPA non signé)" \
+              --notes-file notes.md \
+              --target "$GITHUB_SHA" \
+              $FLAGS
+          fi
+          {
+            echo ""
+            echo "Release : https://github.com/${{ github.repository }}/releases/tag/$TAG"
+            echo "Lien stable : https://github.com/${{ github.repository }}/releases/latest/download/Pal.ipa"
+          } >> "$GITHUB_STEP_SUMMARY"
