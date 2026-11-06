@@ -4,20 +4,70 @@ import os
 import Darwin
 
 struct Msg: Identifiable, Codable { var id = UUID(); var role: String; var text: String }
+
 struct ModelEntry: Identifiable, Codable {
     var id = UUID(); var name: String; var bookmark: Data; var sizeMB: Int
     var mmproj: Data? = nil; var mmprojName: String? = nil
+    var relPath: String? = nil      // chemin relatif dans Documents (modèles du dossier Pal)
+    var mmprojRel: String? = nil
 }
 
-enum DevicePreset: String, CaseIterable, Identifiable {
-    case economy, balanced, custom
+enum PerfProfile: String, CaseIterable, Identifiable {
+    case eco, balanced, performance, custom
     var id: String { rawValue }
+
     var title: String {
         switch self {
-        case .economy: return "Économie mémoire"
+        case .eco: return "Éco"
         case .balanced: return "Équilibré"
-        case .custom: return "Personnalisé"
+        case .performance: return "Max"
+        case .custom: return "Perso"
         }
+    }
+    var icon: String {
+        switch self {
+        case .eco: return "leaf.fill"
+        case .balanced: return "scale.3d"
+        case .performance: return "bolt.fill"
+        case .custom: return "slider.horizontal.3"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .eco: return "Peu de RAM, batterie ménagée. Idéal pour un iPhone XR."
+        case .balanced: return "Bon compromis vitesse / mémoire."
+        case .performance: return "Contexte long et GPU Metal (expérimental, plus de RAM)."
+        case .custom: return "Réglages personnalisés."
+        }
+    }
+
+    func apply(_ cfg: inout Cfg) {
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        switch self {
+        case .eco:
+            cfg.nCtx = 768; cfg.nBatch = 64; cfg.threads = min(2, cores)
+            cfg.gpuLayers = 0; cfg.maxTokens = 192
+        case .balanced:
+            cfg.nCtx = 1024; cfg.nBatch = 128; cfg.threads = min(3, cores)
+            cfg.gpuLayers = 0; cfg.maxTokens = 256
+        case .performance:
+            cfg.nCtx = 2048; cfg.nBatch = 256; cfg.threads = max(2, min(4, cores - 1))
+            cfg.gpuLayers = 99; cfg.maxTokens = 512
+        case .custom:
+            break
+        }
+    }
+
+    static func detect(_ cfg: Cfg) -> PerfProfile {
+        for profile in [PerfProfile.eco, .balanced, .performance] {
+            var probe = cfg
+            profile.apply(&probe)
+            if probe.nCtx == cfg.nCtx && probe.nBatch == cfg.nBatch && probe.threads == cfg.threads
+                && probe.gpuLayers == cfg.gpuLayers && probe.maxTokens == cfg.maxTokens {
+                return profile
+            }
+        }
+        return .custom
     }
 }
 
@@ -64,16 +114,23 @@ enum Sys {
         return "\(Int(l * 100)) %" + (UIDevice.current.batteryState == .charging ? " ⚡︎" : "")
     }
     static var disk: String {
+        String(format: "%.1f Go", Double(freeDiskBytes()) / 1e9)
+    }
+    static func freeDiskBytes() -> Int64 {
         let v = try? URL(fileURLWithPath: NSHomeDirectory()).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return String(format: "%.1f Go", Double(v?.volumeAvailableCapacityForImportantUsage ?? 0) / 1e9)
+        return v?.volumeAvailableCapacityForImportantUsage ?? 0
     }
 }
 
 @MainActor final class VM: ObservableObject {
     let engine = Engine()
+    let speaker = Speaker()
     @Published var cfg = Cfg() { didSet { if let d = try? JSONEncoder().encode(cfg) { UD.set(d, forKey: "cfg") } } }
+    @Published var prefs = Prefs() { didSet { if let d = try? JSONEncoder().encode(prefs) { UD.set(d, forKey: "prefs") } } }
     @Published var models: [ModelEntry] = []
     @Published var skills: [PalSkill] = PalSkill.defaults
+    @Published var conversations: [Conversation] = []
+    @Published var currentChatID = UUID()
     @Published var currentID: UUID?
     @Published var messages: [Msg] = []
     @Published var streaming: String?
@@ -82,29 +139,149 @@ enum Sys {
     @Published var stats = GenStats()
     @Published var loading = false
     @Published var benchmark = ""
+    @Published var requestModelPicker = false
     private var memWarn = false
+    private var pendingSend = false
+    private var pendingSignature = ""
+    private var loadedSignature = ""
+    private var idleTask: Task<Void, Never>?
     var generating: Bool { streaming != nil }
     private var scoped: URL?
-    private let UD = UserDefaults.standard
-    private var chatURL: URL { FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("chat.json") }
+    let UD = UserDefaults.standard
 
     init() {
+        PalFolders.prepare()
         if let d = UD.data(forKey: "cfg"), let c = try? JSONDecoder().decode(Cfg.self, from: d) { cfg = c }
+        if let d = UD.data(forKey: "prefs"), let p = try? JSONDecoder().decode(Prefs.self, from: d) { prefs = p }
         if let d = UD.data(forKey: "models"), let m = try? JSONDecoder().decode([ModelEntry].self, from: d) { models = m }
         if let d = UD.data(forKey: "skills"), let saved = try? JSONDecoder().decode([PalSkill].self, from: d) { skills = saved }
-        if let d = try? Data(contentsOf: chatURL), let m = try? JSONDecoder().decode([Msg].self, from: d) { messages = m }
+        loadConversations()
+        scanLibrary()
         NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.generating else { return }
-                self.engine.unload(); self.status = "Déchargé (mémoire faible)"
+                self.unloadModel(reason: "Déchargé (mémoire faible)")
             }
         }
-        if let s = UD.string(forKey: "last"), let e = models.first(where: { $0.id.uuidString == s }) { select(e) }
+        chooseLaunchModel()
+        if DownloadManager.hasActiveItems { attachDownloads() }
     }
 
     var currentName: String { models.first { $0.id == currentID }?.name ?? "Pal" }
-    private func saveModels() { if let d = try? JSONEncoder().encode(models) { UD.set(d, forKey: "models") } }
-    private func saveSkills() { if let d = try? JSONEncoder().encode(skills) { UD.set(d, forKey: "skills") } }
+    func saveModels() { if let d = try? JSONEncoder().encode(models) { UD.set(d, forKey: "models") } }
+    func saveSkills() { if let d = try? JSONEncoder().encode(skills) { UD.set(d, forKey: "skills") } }
+
+    // MARK: conversations
+
+    private static func makeTitle(_ msgs: [Msg]) -> String {
+        guard let first = msgs.first(where: { $0.role == "user" }) else { return "Nouvelle discussion" }
+        let line = first.text.components(separatedBy: .newlines).first ?? first.text
+        let t = line.trimmingCharacters(in: .whitespaces)
+        return t.isEmpty ? "Nouvelle discussion" : String(t.prefix(44))
+    }
+
+    private func loadConversations() {
+        if let d = try? Data(contentsOf: PalStore.conversationsURL),
+           let list = try? JSONDecoder().decode([Conversation].self, from: d), !list.isEmpty {
+            conversations = list
+        } else if let d = try? Data(contentsOf: PalStore.legacyChatURL),
+                  let old = try? JSONDecoder().decode([Msg].self, from: d), !old.isEmpty {
+            var c = Conversation()
+            c.messages = old
+            c.title = VM.makeTitle(old)
+            conversations = [c]
+        } else {
+            conversations = [Conversation()]
+        }
+        let latest = conversations.max(by: { $0.updated < $1.updated }) ?? conversations[0]
+        currentChatID = latest.id
+        messages = latest.messages
+    }
+
+    private func syncCurrent() {
+        guard let i = conversations.firstIndex(where: { $0.id == currentChatID }) else { return }
+        let changed = conversations[i].messages.count != messages.count
+            || conversations[i].messages.last?.text != messages.last?.text
+        conversations[i].messages = messages
+        if conversations[i].title == "Nouvelle discussion" {
+            conversations[i].title = VM.makeTitle(messages)
+        }
+        if changed { conversations[i].updated = Date() }
+    }
+
+    func saveConversations() {
+        syncCurrent()
+        if let d = try? JSONEncoder().encode(conversations) {
+            try? d.write(to: PalStore.conversationsURL, options: .atomic)
+        }
+    }
+
+    private func saveChat() { saveConversations() }
+
+    private func newChatModel() -> ModelEntry? {
+        guard let id = prefs.newChatModelID else { return nil }
+        return models.first { $0.id.uuidString == id }
+    }
+
+    /// Change le modèle courant sans le charger : il se chargera au prochain envoi.
+    private func applyChatModel(_ id: UUID?) {
+        guard !generating, !loading, let id, id != currentID,
+              let entry = models.first(where: { $0.id == id }) else { return }
+        if engine.loaded { unloadModel(reason: "Déchargé") }
+        currentID = id
+        UD.set(id.uuidString, forKey: "last")
+        status = "\(entry.name) · se charge à l'envoi"
+    }
+
+    func newChat() {
+        guard !generating, !loading else { return }
+        speaker.stop()
+        if !messages.isEmpty {
+            saveConversations()
+            var chat = Conversation()
+            chat.modelID = newChatModel()?.id ?? currentID
+            conversations.insert(chat, at: 0)
+            currentChatID = chat.id
+            messages = []
+            saveConversations()
+        }
+        if let target = newChatModel() { applyChatModel(target.id) }
+        engine.restore(system: effectiveSystemPrompt, history: [])
+    }
+
+    func openChat(_ id: UUID) {
+        guard !generating, !loading, id != currentChatID,
+              let target = conversations.first(where: { $0.id == id }) else { return }
+        speaker.stop()
+        saveConversations()
+        currentChatID = id
+        messages = target.messages
+        applyChatModel(target.modelID)
+        engine.restore(system: effectiveSystemPrompt, history: messages)
+    }
+
+    func deleteChat(_ id: UUID) {
+        guard !generating, !loading else { return }
+        conversations.removeAll { $0.id == id }
+        if conversations.isEmpty { conversations = [Conversation()] }
+        if id == currentChatID {
+            let next = conversations.max(by: { $0.updated < $1.updated }) ?? conversations[0]
+            currentChatID = next.id
+            messages = next.messages
+            applyChatModel(next.modelID)
+            engine.restore(system: effectiveSystemPrompt, history: messages)
+        }
+        saveConversations()
+    }
+
+    func renameChat(_ id: UUID, _ title: String) {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, let i = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[i].title = String(clean.prefix(60))
+        saveConversations()
+    }
+
+    // MARK: prompt système et compétences
 
     var effectiveSystemPrompt: String {
         let enabled = skills.filter(\.enabled)
@@ -177,10 +354,40 @@ enum Sys {
     func insertResearchContext(_ context: String) {
         input = context
     }
-    private func saveChat() { if let d = try? JSONEncoder().encode(messages) { try? d.write(to: chatURL) } }
+
     private func tap() { if cfg.haptics { UIImpactFeedbackGenerator(style: .light).impactOccurred() } }
 
-    // MARK: modèles (lus en place via bookmark, jamais copiés)
+    // MARK: Hugging Face
+
+    var hfToken: String { Keychain.get("hf-token") ?? "" }
+
+    func setHFToken(_ token: String) {
+        Keychain.set(token.trimmingCharacters(in: .whitespacesAndNewlines), for: "hf-token")
+        objectWillChange.send()
+    }
+
+    func attachDownloads() {
+        let manager = DownloadManager.shared
+        manager.onFinished = { [weak self] url in
+            Task { @MainActor in self?.downloadFinished(url) }
+        }
+        manager.activate()
+    }
+
+    private func downloadFinished(_ url: URL) {
+        scanLibrary()
+        status = "Téléchargé : " + url.deletingPathExtension().lastPathComponent
+    }
+
+    func useDownloaded(_ filename: String) {
+        scanLibrary()
+        if let entry = models.first(where: { $0.relPath == "Models/" + filename || $0.relPath == filename }) {
+            select(entry)
+        }
+    }
+
+    // MARK: modèles (dossier Pal, ou lus en place via signet)
+
     private func bookmark(_ url: URL) -> (Data, Int)? {
         let didStartAccess = url.startAccessingSecurityScopedResource()
         let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path + "/"
@@ -195,14 +402,15 @@ enum Sys {
         return (data, size / 1_048_576)
     }
 
-    func addModel(_ url: URL) {
+    @discardableResult
+    func addModel(_ url: URL) -> Bool {
         guard url.pathExtension.lowercased() == "gguf" else {
-            status = "Choisis un fichier .gguf"
-            return
+            status = "Choisis un fichier .gguf (fichier reçu : \(url.lastPathComponent))"
+            return false
         }
         guard let result = bookmark(url) else {
             status = "Impossible d'enregistrer l'accès au fichier"
-            return
+            return false
         }
         let entry = ModelEntry(
             name: url.deletingPathExtension().lastPathComponent,
@@ -212,6 +420,35 @@ enum Sys {
         models.append(entry)
         saveModels()
         select(entry)
+        return true
+    }
+
+    /// Plan B : copie le GGUF dans Documents/Models (dossier de Pal) puis le détecte.
+    @discardableResult
+    func importModelCopy(_ url: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "gguf" else {
+            status = "Choisis un fichier .gguf (fichier reçu : \(url.lastPathComponent))"
+            return false
+        }
+        let access = url.startAccessingSecurityScopedResource()
+        defer { if access { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let fm = FileManager.default
+            try fm.createDirectory(at: PalFolders.models, withIntermediateDirectories: true)
+            let dest = PalFolders.models.appendingPathComponent(url.lastPathComponent)
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.copyItem(at: url, to: dest)
+            scanLibrary()
+            if let rel = PalFolders.relativePath(of: dest),
+               let entry = models.first(where: { $0.relPath == rel }) {
+                select(entry)
+                return true
+            }
+            return false
+        } catch {
+            status = "Copie impossible : \(error.localizedDescription)"
+            return false
+        }
     }
 
     func addMMProj(_ url: URL, to id: UUID) {
@@ -256,16 +493,97 @@ enum Sys {
         return output
     }
 
-    func applyDevicePreset(_ preset: DevicePreset) {
-        guard !loading, !generating else { return }
-        switch preset {
-        case .economy:
-            cfg.nCtx = 768; cfg.nBatch = 64; cfg.threads = 2
-            cfg.gpuLayers = 0; cfg.maxTokens = 192
-        case .balanced:
-            cfg.nCtx = 1024; cfg.nBatch = 128; cfg.threads = 3
-            cfg.gpuLayers = 0; cfg.maxTokens = 256
-        case .custom:
+    // MARK: performance
+
+    private func signature() -> String {
+        "\(cfg.nCtx)/\(cfg.nBatch)/\(cfg.gpuLayers)/\(prefs.mmap)"
+    }
+
+    var needsReload: Bool {
+        engine.loaded && !loadedSignature.isEmpty && loadedSignature != signature()
+    }
+
+    func applyProfile(_ profile: PerfProfile) {
+        guard !loading, !generating, profile != .custom else { return }
+        var updated = cfg
+        profile.apply(&updated)
+        cfg = updated
+    }
+
+    private func effectiveThreads() -> Int {
+        var n = max(1, min(cfg.threads, ProcessInfo.processInfo.activeProcessorCount))
+        guard prefs.thermalGuard else { return n }
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious, .critical: n = max(1, n / 2)
+        case .fair: n = max(1, n - 1)
+        default: break
+        }
+        if ProcessInfo.processInfo.isLowPowerModeEnabled { n = max(1, n - 1) }
+        return n
+    }
+
+    // MARK: modèle par défaut, déchargement automatique
+
+    func setLaunchModel(_ entry: ModelEntry) {
+        prefs.launchMode = 2
+        prefs.launchModelID = entry.id.uuidString
+    }
+
+    func setNewChatModel(_ entry: ModelEntry?) {
+        prefs.newChatModelID = entry?.id.uuidString
+    }
+
+    private func chooseLaunchModel() {
+        var candidate: ModelEntry?
+        if prefs.launchMode == 2 {
+            candidate = models.first { $0.id.uuidString == prefs.launchModelID }
+        }
+        if candidate == nil, let chatModel = conversations.first(where: { $0.id == currentChatID })?.modelID {
+            candidate = models.first { $0.id == chatModel }
+        }
+        if candidate == nil, let saved = UD.string(forKey: "last") {
+            candidate = models.first { $0.id.uuidString == saved }
+        }
+        guard let chosen = candidate else { return }
+        if prefs.launchMode == 0 {
+            currentID = chosen.id
+            status = "\(chosen.name) · se charge à l'envoi"
+        } else {
+            select(chosen, assign: false)
+        }
+    }
+
+    func unloadModel(reason: String = "Déchargé") {
+        guard !generating, !loading else { return }
+        idleTask?.cancel()
+        engine.unload()
+        scoped?.stopAccessingSecurityScopedResource()
+        scoped = nil
+        loadedSignature = ""
+        status = "\(reason) · se recharge à l'envoi"
+        objectWillChange.send()
+    }
+
+    private func scheduleIdleUnload() {
+        idleTask?.cancel()
+        let minutes = prefs.autoUnloadMinutes
+        guard minutes > 0, engine.loaded else { return }
+        idleTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(minutes) * 60 * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.unloadModel(reason: "Déchargé (inactif)")
+        }
+    }
+
+    func scenePhaseChanged(_ phase: ScenePhase) {
+        switch phase {
+        case .active:
+            scanLibrary()
+        case .background:
+            if prefs.unloadInBackground && !generating && !loading && engine.loaded {
+                unloadModel(reason: "Déchargé (arrière-plan)")
+            }
+        default:
             break
         }
     }
@@ -282,27 +600,53 @@ enum Sys {
         saveModels()
     }
 
-    func select(_ entry: ModelEntry) {
+    /// Supprime le fichier d'un modèle du dossier Pal (libère l'espace).
+    func deleteModelFile(_ entry: ModelEntry) {
+        if entry.id == currentID {
+            unloadModel(reason: "Déchargé")
+            currentID = nil
+            status = "Aucun modèle"
+        }
+        if let rel = entry.relPath {
+            try? FileManager.default.removeItem(at: PalFolders.url(forRelative: rel))
+        }
+        models.removeAll { $0.id == entry.id }
+        saveModels()
+    }
+
+    func select(_ entry: ModelEntry, assign: Bool = true) {
         guard !generating, !loading else { return }
+        idleTask?.cancel()
+        let url: URL
+        var didStartAccess = false
         var stale = false
-        guard let url = try? URL(
-            resolvingBookmarkData: entry.bookmark,
-            bookmarkDataIsStale: &stale
-        ) else {
-            status = "Signet invalide : réimporte le fichier GGUF"
-            return
+
+        if let rel = entry.relPath {
+            url = PalFolders.url(forRelative: rel)
+        } else {
+            guard let resolved = try? URL(
+                resolvingBookmarkData: entry.bookmark,
+                bookmarkDataIsStale: &stale
+            ) else {
+                status = "Signet invalide : réimporte le fichier GGUF"
+                pendingSend = false
+                return
+            }
+            url = resolved
+            didStartAccess = resolved.startAccessingSecurityScopedResource()
+            let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path + "/"
+            let isAppOwned = resolved.standardizedFileURL.path.hasPrefix(home)
+            guard didStartAccess || isAppOwned else {
+                status = "iOS n'a pas accordé l'accès au fichier : réimporte-le depuis Fichiers"
+                pendingSend = false
+                return
+            }
         }
 
-        let didStartAccess = url.startAccessingSecurityScopedResource()
-        let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path + "/"
-        let isAppOwned = url.standardizedFileURL.path.hasPrefix(home)
-        guard didStartAccess || isAppOwned else {
-            status = "iOS n'a pas accordé l'accès au fichier : réimporte-le depuis Fichiers"
-            return
-        }
         guard FileManager.default.fileExists(atPath: url.path) else {
             if didStartAccess { url.stopAccessingSecurityScopedResource() }
             status = "Fichier introuvable ou non téléchargé dans Fichiers"
+            pendingSend = false
             return
         }
 
@@ -317,44 +661,75 @@ enum Sys {
         }
 
         currentID = entry.id
+        if assign, let i = conversations.firstIndex(where: { $0.id == currentChatID }) {
+            conversations[i].modelID = entry.id
+            saveConversations()
+        }
         UD.set(entry.id.uuidString, forKey: "last")
         status = "Chargement…"
         loading = true
+        pendingSignature = signature()
 
         memWarn = !engine.loaded && Double(entry.sizeMB) * 1.1 > Sys.availMB()
         let config = cfg
+        let useMmap = prefs.mmap
         let modelEngine = engine
         let modelPath = url.path
         Task.detached(priority: .userInitiated) {
-            let success = modelEngine.load(path: modelPath, cfg: config)
+            let success = modelEngine.load(path: modelPath, cfg: config, mmap: useMmap)
             await self.loaded(success)
         }
     }
 
     func reload() {
         if let entry = models.first(where: { $0.id == currentID }) {
-            select(entry)
+            select(entry, assign: false)
         }
     }
 
     private func loaded(_ success: Bool) {
         loading = false
         if success {
+            loadedSignature = pendingSignature
             engine.restore(system: effectiveSystemPrompt, history: messages)
             status = "\(engine.info) · prêt" + (memWarn ? " · ⚠︎ RAM juste" : "")
+            scheduleIdleUnload()
+            if pendingSend {
+                pendingSend = false
+                send()
+            }
         } else {
+            pendingSend = false
             status = "Échec du chargement : GGUF invalide, mémoire insuffisante ou fichier inaccessible"
         }
     }
 
     // MARK: chat
+
     func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !generating, engine.loaded else { return }
+        guard !text.isEmpty, !generating, !loading else { return }
+
+        // Modèle déchargé : on le recharge automatiquement puis on envoie.
+        if !engine.loaded {
+            guard let entry = models.first(where: { $0.id == currentID }) ?? models.first else {
+                status = "Ajoute d'abord un modèle"
+                requestModelPicker = true
+                return
+            }
+            pendingSend = true
+            select(entry, assign: currentID == nil)
+            if !loading { pendingSend = false }
+            return
+        }
+
+        idleTask?.cancel()
         input = ""; engine.restore(system: effectiveSystemPrompt, history: messages); messages.append(Msg(role: "user", text: text)); streaming = ""; tap()
+        speaker.stop()
         UIApplication.shared.isIdleTimerDisabled = cfg.keepAwake
-        let c = cfg, e = engine
+        let c = cfg, e = engine, threadCount = effectiveThreads()
         Task.detached {
+            e.setThreads(threadCount)
             var acc = "", last = Date()
             do {
                 let st = try e.generate(user: text, cfg: c) { p in
@@ -368,6 +743,7 @@ enum Sys {
             } catch { await self.finish(acc, nil, (error as? EngineError)?.msg ?? "Erreur") }
         }
     }
+
     private func finish(_ text: String, _ st: GenStats?, _ err: String?) {
         if let st { stats = st; messages.append(Msg(role: "assistant", text: text)) }
         if let err {
@@ -378,12 +754,14 @@ enum Sys {
         }
         streaming = nil; saveChat(); tap()
         UIApplication.shared.isIdleTimerDisabled = false
+        scheduleIdleUnload()
+        if st != nil, err == nil, prefs.ttsAuto, !text.isEmpty {
+            speaker.speak(text, voiceID: prefs.ttsVoice, rate: prefs.ttsRate)
+        }
     }
+
     func stop() { engine.cancel = true }
-    func newChat() {
-        guard !generating else { return }
-        messages = []; saveChat(); engine.restore(system: effectiveSystemPrompt, history: [])
-    }
+
     func regenerate() {
         guard !generating, messages.count >= 2, messages.last?.role == "assistant" else { return }
         messages.removeLast()
