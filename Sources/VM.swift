@@ -3,7 +3,13 @@ import UIKit
 import os
 import Darwin
 
-struct Msg: Identifiable, Codable { var id = UUID(); var role: String; var text: String }
+struct Msg: Identifiable, Codable {
+    var id = UUID()
+    var role: String
+    var text: String
+    var thinkSeconds: Double? = nil
+    var stat: String? = nil
+}
 
 struct ModelEntry: Identifiable, Codable {
     var id = UUID(); var name: String; var bookmark: Data; var sizeMB: Int
@@ -140,6 +146,9 @@ enum Sys {
     @Published var loading = false
     @Published var benchmark = ""
     @Published var requestModelPicker = false
+    @Published var personas: [Persona] = Persona.defaults
+    private var genStart = Date()
+    private var thinkEnd: Date?
     private var memWarn = false
     private var pendingSend = false
     private var pendingSignature = ""
@@ -155,6 +164,7 @@ enum Sys {
         if let d = UD.data(forKey: "prefs"), let p = try? JSONDecoder().decode(Prefs.self, from: d) { prefs = p }
         if let d = UD.data(forKey: "models"), let m = try? JSONDecoder().decode([ModelEntry].self, from: d) { models = m }
         if let d = UD.data(forKey: "skills"), let saved = try? JSONDecoder().decode([PalSkill].self, from: d) { skills = saved }
+        if let d = UD.data(forKey: "personas"), let saved = try? JSONDecoder().decode([Persona].self, from: d), !saved.isEmpty { personas = saved }
         loadConversations()
         scanLibrary()
         NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
@@ -168,6 +178,64 @@ enum Sys {
     }
 
     var currentName: String { models.first { $0.id == currentID }?.name ?? "Pal" }
+
+    var fontDesign: Font.Design {
+        switch prefs.fontDesign {
+        case 1: return .rounded
+        case 2: return .serif
+        case 3: return .monospaced
+        default: return .default
+        }
+    }
+
+    /// Vrai si le modèle courant produit une phase de réflexion (DeepSeek R1, Qwen3, QwQ…).
+    var modelThinks: Bool {
+        let name = currentName.lowercased()
+        return ["r1", "think", "qwq", "qwen3", "reason"].contains { name.contains($0) }
+    }
+
+    // MARK: personnages (prompts système nommés)
+
+    var currentPersona: Persona? {
+        guard let id = conversations.first(where: { $0.id == currentChatID })?.personaID else { return nil }
+        return personas.first { $0.id == id }
+    }
+
+    private func savePersonas() {
+        if let d = try? JSONEncoder().encode(personas) { UD.set(d, forKey: "personas") }
+    }
+
+    func savePersona(_ persona: Persona) {
+        let name = persona.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = persona.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !prompt.isEmpty else { return }
+        var updated = persona
+        updated.name = String(name.prefix(40))
+        updated.prompt = String(prompt.prefix(4000))
+        if let index = personas.firstIndex(where: { $0.id == persona.id }) {
+            personas[index] = updated
+        } else {
+            personas.append(updated)
+        }
+        savePersonas()
+        engine.restore(system: effectiveSystemPrompt, history: messages)
+    }
+
+    func deletePersona(_ id: String) {
+        personas.removeAll { $0.id == id && !$0.builtIn }
+        for index in conversations.indices where conversations[index].personaID == id {
+            conversations[index].personaID = nil
+        }
+        savePersonas()
+        saveConversations()
+    }
+
+    func setPersona(_ id: String?) {
+        guard let index = conversations.firstIndex(where: { $0.id == currentChatID }) else { return }
+        conversations[index].personaID = id
+        saveConversations()
+        engine.restore(system: effectiveSystemPrompt, history: messages)
+    }
     func saveModels() { if let d = try? JSONEncoder().encode(models) { UD.set(d, forKey: "models") } }
     func saveSkills() { if let d = try? JSONEncoder().encode(skills) { UD.set(d, forKey: "skills") } }
 
@@ -284,14 +352,15 @@ enum Sys {
     // MARK: prompt système et compétences
 
     var effectiveSystemPrompt: String {
+        let base = currentPersona?.prompt ?? cfg.system
         let enabled = skills.filter(\.enabled)
-        guard !enabled.isEmpty else { return cfg.system }
+        guard !enabled.isEmpty else { return base }
         let skillText = enabled.map { skill in
             "SKILL: \(skill.name)\n\(skill.instructions)"
         }.joined(separator: "\n\n")
         // Limite la surcharge de contexte sur les appareils à mémoire réduite.
         let bounded = String(skillText.prefix(9000))
-        return cfg.system + "\n\nCompétences activées (instructions de l'utilisateur) :\n" +
+        return base + "\n\nCompétences activées (instructions de l'utilisateur) :\n" +
             bounded + "\n\nApplique ces compétences si elles sont pertinentes. Ne prétends pas avoir exécuté une action ou consulté une source si ce n'est pas le cas."
     }
 
@@ -726,6 +795,8 @@ enum Sys {
         idleTask?.cancel()
         input = ""; engine.restore(system: effectiveSystemPrompt, history: messages); messages.append(Msg(role: "user", text: text)); streaming = ""; tap()
         speaker.stop()
+        genStart = Date()
+        thinkEnd = nil
         UIApplication.shared.isIdleTimerDisabled = cfg.keepAwake
         let c = cfg, e = engine, threadCount = effectiveThreads()
         Task.detached {
@@ -736,7 +807,12 @@ enum Sys {
                     acc += p
                     if Date().timeIntervalSince(last) > 0.05 {
                         last = Date(); let snap = acc
-                        Task { @MainActor in if self.streaming != nil { self.streaming = snap } }
+                        Task { @MainActor in
+                            if self.streaming != nil {
+                                self.streaming = snap
+                                if self.thinkEnd == nil && snap.contains("</think>") { self.thinkEnd = Date() }
+                            }
+                        }
                     }
                 }
                 await self.finish(acc, st, nil)
@@ -745,7 +821,14 @@ enum Sys {
     }
 
     private func finish(_ text: String, _ st: GenStats?, _ err: String?) {
-        if let st { stats = st; messages.append(Msg(role: "assistant", text: text)) }
+        if let st {
+            stats = st
+            if thinkEnd == nil && text.contains("</think>") { thinkEnd = Date() }
+            let seconds = thinkEnd.map { $0.timeIntervalSince(genStart) }
+            let perToken = st.genTps > 0 ? 1000 / st.genTps : 0
+            let line = String(format: "%.0f ms/token · %.1f tokens/s · 1er token %.1f s", perToken, st.genTps, st.ttft)
+            messages.append(Msg(role: "assistant", text: text, thinkSeconds: seconds, stat: line))
+        }
         if let err {
             status = err
             engine.restore(system: effectiveSystemPrompt, history: messages)
